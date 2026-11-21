@@ -2,7 +2,7 @@
 # Tests for heeler-kit on a Mac that already runs it. Never signs anything in, never touches the
 # live LaunchAgent, its state or the Heeler plugin: the fresh-install path runs under a test label
 # and a temp state dir, stops at the sign-in link, then uninstalls with --keep-plugin.
-# Usage: bash test.sh   (HEELER_KIT_PACK=<path to a pack script> adds the zip checks)
+# Usage: bash test.sh
 set -u
 cd "$(dirname "$0")" || exit 1
 KIT=./heeler-kit
@@ -113,10 +113,9 @@ if [ "${TEST_RESTART_LIVE:-}" = 1 ] && [ -n "$live_running" ]; then
   t "install after a restart keeps the name ($name_before)" "[ '$name_before' = '$name_after' ]"
 fi
 
-# Run install.sh --with-next-steps under a throwaway HOME and Claude config dir: next-steps comes from GitHub
-# at the tag install.sh pins. The real ~/.claude is only read. With HEELER_KIT_PACK set to a pack script
-# (the zip builder, kept outside this repo), the kit is packed first and the install runs from the unpacked
-# zip; otherwise from a copy of this folder. Needs the claude command and GitHub; skipped without them.
+# Run install.sh --with-next-steps from a copy of this folder under a throwaway HOME and Claude config dir:
+# next-steps comes from GitHub at the tag install.sh pins. The real ~/.claude is only read. Needs the claude
+# command and GitHub; skipped without them.
 ns_source=$(sed -n "s/^NEXT_STEPS_SOURCE='\(.*\)'$/\1/p" install.sh)
 ns_id=$(sed -n "s/^NEXT_STEPS_ID='\(.*\)'$/\1/p" install.sh)
 ns_tag=${ns_source#*#}
@@ -125,21 +124,9 @@ if command -v claude >/dev/null && git ls-remote --exit-code --tags "https://git
   pk=$(mktemp -d "${TMPDIR:-/tmp}/heeler-packtest.XXXXXX")
   real_mk="$HOME/.claude/plugins/known_marketplaces.json"
   real_before=$(cksum "$real_mk" 2>/dev/null)
-  if [ -n "${HEELER_KIT_PACK:-}" ]; then
-    HEELER_KIT_DIR="$PWD" HEELER_PACK_OUT="$pk/out" bash "$HEELER_KIT_PACK" -test >/dev/null 2>&1; rc=$?
-    t "pack succeeds" "[ $rc -eq 0 ]"
-    zip=$(find "$pk/out" -name '*.zip' -print -quit 2>/dev/null)
-    # shellcheck disable=SC2034  # read inside t's condition string, which t evals
-    list=$(unzip -Z1 "$zip" 2>/dev/null)
-    t "zip has install.sh" "printf '%s\n' \"\$list\" | grep -qx 'heeler-kit/install.sh'"
-    t "zip doesn't bundle next-steps/" "! printf '%s\n' \"\$list\" | grep -q 'heeler-kit/next-steps/'"
-    unzip -q "$zip" -d "$pk/unz"
-  else
-    echo "skip zip checks: HEELER_KIT_PACK not set (install checks run from a copy of this folder)"
-    mkdir -p "$pk/unz/heeler-kit"
-    cp -R heeler-kit install.sh README.md skill "$pk/unz/heeler-kit/"
-  fi
-  kit="$pk/unz/heeler-kit"
+  mkdir -p "$pk/kit"
+  cp -R heeler-kit install.sh README.md skill "$pk/kit/"
+  kit="$pk/kit"
   t "install.sh pins owner/repo#tag" "printf '%s' '$ns_source' | grep -Eq '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+#[A-Za-z0-9._-]+$'"
 
   mkdir -p "$pk/home/.claude"

@@ -26,8 +26,7 @@ bash install.sh
 heeler-kit install
 ```
 
-No git or no internet at that point? The same files also come as a zip: unzip it and run `bash install.sh`
-from the folder. Updating later: `git pull`, then `bash install.sh` again.
+Updating later: `git pull`, then `bash install.sh` again.
 
 `heeler-kit install` stops and prints a Tailscale sign-in link. Open it, sign in, then run
 `heeler-kit install` again. It finishes the setup and installs the Heeler herdr plugin.
