@@ -1,0 +1,554 @@
+#!/bin/bash
+# heeler-kit: reach this Mac's herdr agents from an iPhone or iPad with Heeler
+# (https://github.com/ZingerLittleBee/Heeler), over Tailscale in userspace mode.
+#
+# Userspace mode means no VPN and no network extension on the Mac, and no sudo. The cost: any
+# device in the tailnet can reach every service listening on the Mac, including ones bound to
+# 127.0.0.1. So the tailnet policy must allow SSH (tcp:22) only; `heeler-kit policy` prints one.
+#
+# Commands (each one is safe to run again):
+#   install [--hostname NAME]  Tailscale + LaunchAgent + sign-in, then the pinned Heeler herdr plugin.
+#                              Stops after printing the sign-in link; run it again once signed in.
+#                              NAME defaults to <user>-mac on first sign-in; later runs keep the name
+#                              unless --hostname is given.
+#   status                     What is set up and running, and which paired devices are connected.
+#   policy                     The tailnet access policy to paste (SSH to this Mac only).
+#   pair [--force]             Show the pairing code in herdr, to scan with the Heeler app. When a phone
+#                              is already paired (registered with the plugin, or an SSH session open now)
+#                              it says so instead; --force shows a code anyway, for another device.
+#   harden-ssh                 Check or print the sudo lines that turn off SSH password logins.
+#   uninstall [--keep-plugin] [--purge]
+#                              Remove the Heeler plugin (unless --keep-plugin: Heeler then still works
+#                              on the local network) and the LaunchAgent. --purge also signs this Mac
+#                              out of the tailnet, moves its Tailscale state to the Trash and removes
+#                              the Homebrew formula.
+#
+# Exit codes: 0 done, 1 error, 3 waiting for you (sign in, start herdr, turn on Remote Login).
+# Env: HEELER_REF (plugin commit); for tests: HEELER_KIT_LABEL, HEELER_KIT_STATE, HEELER_KIT_LSOF_FILE,
+#      HEELER_KIT_SSH_ALLOWED.
+
+# No pipefail on purpose: `cmd | grep -q` and `cmd | head -1` stop reading early, the writer gets
+# SIGPIPE, and pipefail would count that as a failure. Steps that matter are checked explicitly.
+set -eu
+
+KIT_VERSION="2026-11-21.5"
+# Heeler herdr plugin 0.10.0 (branch `plugin` on 2026-11-15). Move only after testing a newer one.
+HEELER_REF="${HEELER_REF:-b75384ffef59d9efa8559c3ef57ea12eb0a03910}"
+LABEL="${HEELER_KIT_LABEL:-dev.heeler.tailscaled}"
+STATE_DIR="${HEELER_KIT_STATE:-$HOME/.local/share/heeler-tailscale}"
+SOCK="$STATE_DIR/tailscaled.socket"
+UP_LOG="$STATE_DIR/up.log"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+# The default agent logs to heeler-tailscaled.log; any other label (tests) gets its own file.
+if [ "$LABEL" = dev.heeler.tailscaled ]; then DAEMON_LOG="$HOME/Library/Logs/heeler-tailscaled.log"
+else DAEMON_LOG="$HOME/Library/Logs/$LABEL.log"; fi
+DROPIN="/etc/ssh/sshd_config.d/100-key-only.conf"
+HERDR_PLUGINS="$HOME/.config/herdr/plugins.json"
+MIN_HERDR="0.7.5"
+MIN_NODE="20.0.0"
+WAIT=3
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  [ok]  %s\n' "$*"; }
+todo() { printf '  [--]  %s\n' "$*"; }
+bad()  { printf '  [!!]  %s\n' "$*"; }
+die()  { printf 'heeler-kit: %s\n' "$*" >&2; exit 1; }
+next() { printf '\nNext: %s\n' "$*"; }
+
+# ---------- helpers ----------
+
+# 0 when version $1 >= $2 (dotted numbers; anything after a dash is ignored).
+version_ge() {
+  awk -v a="${1%%-*}" -v b="${2%%-*}" 'BEGIN {
+    n = split(a, x, "."); m = split(b, y, "."); k = (n > m ? n : m)
+    for (i = 1; i <= k; i++) { if ((x[i] + 0) > (y[i] + 0)) exit 0; if ((x[i] + 0) < (y[i] + 0)) exit 1 }
+    exit 0 }'
+}
+
+need_basics() {
+  [ "$(uname -s)" = Darwin ] || die "macOS only"
+  command -v brew >/dev/null 2>&1 || die "Homebrew is required (https://brew.sh)"
+  command -v jq >/dev/null 2>&1 || die "jq is required (macOS 15+ ships /usr/bin/jq; else: brew install jq)"
+}
+
+ts_prefix() { brew --prefix tailscale 2>/dev/null || true; }
+ts_installed() { [ -x "$(ts_prefix)/bin/tailscaled" ]; }
+ts() { "$(ts_prefix)/bin/tailscale" --socket="$SOCK" "$@"; }
+ts_json() { ts status --json 2>/dev/null || echo '{}'; }
+backend() { ts_json | jq -r '.BackendState // "Stopped"'; }
+
+sshd_on() { nc -z -G 2 127.0.0.1 22 >/dev/null 2>&1; }
+agent_pid() { launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '$1 == "pid" { print $3; exit }'; }
+agent_loaded() { launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; }
+
+herdr_server_up() {
+  local s
+  command -v herdr >/dev/null 2>&1 || return 1
+  s=$(herdr status 2>/dev/null || true)
+  case "$s" in *"status: running"*) return 0 ;; *) return 1 ;; esac
+}
+plugin_commit() {
+  [ -f "$HERDR_PLUGINS" ] || return 0
+  jq -r '.[] | select(.plugin_id == "heeler") | .source.resolved_commit // empty' "$HERDR_PLUGINS" 2>/dev/null || true
+}
+
+# ---------- paired-device detection ----------
+# Two signals, neither of which reads ~/.ssh:
+#   registered  phones the Heeler plugin keeps for notifications (devices[] in its notifications.json;
+#               only the count is read, never a token or key)
+#   live        SSH sessions open now. A direct one shows as sshd's remote address. A tailnet one
+#               (userspace mode) reaches sshd as 127.0.0.1, dialed by tailscaled, so it is counted
+#               from tailscaled's side and named after the tailnet peers with recent traffic.
+
+heeler_cfg_dir() {
+  local d
+  d=$(herdr plugin config-dir heeler 2>/dev/null || true)
+  [ -n "$d" ] || d="$HOME/.config/herdr/plugins/config/heeler"
+  printf '%s\n' "$d"
+}
+
+registered_count() {
+  local f; f="$(heeler_cfg_dir)/notifications.json"
+  [ -f "$f" ] || { echo 0; return; }
+  jq '.devices // [] | length' "$f" 2>/dev/null || echo 0
+}
+
+registered_since() {
+  local f; f="$(heeler_cfg_dir)/notifications.json"
+  [ -f "$f" ] && stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f"
+}
+
+# Raw lines: "direct <ip> <port>" per authenticated session, "tailnet <port>" per tailnet connection.
+# HEELER_KIT_LSOF_FILE (tests only): read lsof output from this file instead of running lsof.
+established_on_22() {
+  if [ -n "${HEELER_KIT_LSOF_FILE:-}" ]; then cat "$HEELER_KIT_LSOF_FILE"; else lsof -nP -iTCP:22 -sTCP:ESTABLISHED 2>/dev/null; fi
+}
+
+ssh_session_lines() {
+  established_on_22 | awk '
+    NR == 1 { next }
+    $1 ~ /^sshd/ {
+      n = split($9, a, "->"); if (n < 2 || a[1] !~ /:22$/) next
+      r = a[2]; port = r; sub(/^.*:/, "", port); sub(/:[0-9]+$/, "", r); gsub(/[][]/, "", r)
+      if (r == "127.0.0.1" || r == "::1") next
+      print "direct " r " " port; next }
+    $1 ~ /^tailscale/ && $9 ~ /->(127\.0\.0\.1|\[::1\]):22$/ {
+      split($9, a, "->"); port = a[1]; sub(/^.*:/, "", port); print "tailnet " port }' | sort -u
+}
+
+# Human lines, one per place a session comes from; empty when nothing is connected.
+live_sessions() {
+  local raw ip where n peers
+  raw=$(ssh_session_lines)
+  for ip in $(printf '%s\n' "$raw" | awk '$1 == "direct" { print $2 }' | sort -u); do
+    case "$ip" in
+      10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|fe80:*|fd*) where="local network" ;;
+      *) where="internet" ;;
+    esac
+    n=$(printf '%s\n' "$raw" | awk -v ip="$ip" '$1 == "direct" && $2 == ip' | wc -l | tr -d ' ')
+    printf '%s (%s), %s session(s)\n' "$where" "$ip" "$n"
+  done
+  n=$(printf '%s\n' "$raw" | awk '$1 == "tailnet"' | wc -l | tr -d ' ')
+  if [ "$n" -gt 0 ]; then
+    peers=""
+    [ -S "$SOCK" ] && peers=$(ts_json | jq -r '[.Peer // {} | to_entries[] | .value | select(.Active) | .HostName] | join(", ")')
+    printf 'the tailnet%s, %s session(s)\n' "${peers:+ (active: $peers)}" "$n"
+  fi
+}
+
+paired_lines() { # prints status lines; returns 0 when a device is registered or connected
+  local n live line found=1
+  n=$(registered_count); live=$(live_sessions)
+  if [ "$n" -gt 0 ]; then ok "Heeler paired: $n device(s) registered for notifications (since $(registered_since))"; found=0
+  else todo "no phone registered with the Heeler plugin yet"; fi
+  if [ -n "$live" ]; then
+    printf '%s\n' "$live" | while IFS= read -r line; do ok "connected now from $line"; done
+    found=0
+  else
+    say "        no SSH session open right now"
+  fi
+  return $found
+}
+
+plist_text() {
+  local p; p="$(ts_prefix)"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Userspace Tailscale for Heeler (no VPN or network extension on the Mac). Written by heeler-kit.
+     Starts at login; keep only one tailscaled running with this state dir.
+     Remove: heeler-kit uninstall -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$p/bin/tailscaled</string>
+        <string>--tun=userspace-networking</string>
+        <string>--statedir=$STATE_DIR</string>
+        <string>--socket=$SOCK</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardErrorPath</key>
+    <string>$DAEMON_LOG</string>
+    <key>StandardOutPath</key>
+    <string>$DAEMON_LOG</string>
+</dict>
+</plist>
+EOF
+}
+
+# ---------- install steps ----------
+
+check_prereqs() {
+  local waiting=0 v
+  say "Checking this Mac"
+  if sshd_on; then ok "Remote Login (SSH) answers on port 22"
+  else bad "Remote Login is off: System Settings > General > Sharing > Remote Login (allow only your user)"; waiting=1; fi
+
+  if command -v herdr >/dev/null 2>&1; then
+    v=$(herdr --version 2>/dev/null | awk '{print $2}')
+    if version_ge "$v" "$MIN_HERDR"; then ok "herdr $v"; else bad "herdr $v is older than $MIN_HERDR: herdr update"; waiting=1; fi
+    if herdr_server_up; then ok "herdr server running"; else bad "herdr server isn't running: start herdr in a terminal tab"; waiting=1; fi
+  else
+    bad "herdr not found (https://herdr.dev)"; waiting=1
+  fi
+
+  if command -v node >/dev/null 2>&1; then
+    v=$(node -v | tr -d v)
+    if version_ge "$v" "$MIN_NODE"; then ok "Node $v"; else bad "Node $v is older than $MIN_NODE (the Heeler plugin needs 20+)"; waiting=1; fi
+  else
+    bad "Node not found (the Heeler plugin needs Node 20+ on PATH)"; waiting=1
+  fi
+  return $waiting
+}
+
+ensure_tailscale() {
+  if ts_installed; then ok "tailscale $("$(ts_prefix)/bin/tailscale" version | head -1) (Homebrew formula)"; return; fi
+  say "Installing the tailscale formula (no app, no VPN)"
+  brew install --formula tailscale
+  ts_installed || die "tailscale didn't install"
+  ok "tailscale $("$(ts_prefix)/bin/tailscale" version | head -1)"
+}
+
+ensure_agent() {
+  local want
+  ( umask 077; mkdir -p "$STATE_DIR" ); chmod 700 "$STATE_DIR"
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$DAEMON_LOG")"
+  want=$(plist_text)
+  if [ ! -f "$PLIST" ] || [ "$(cat "$PLIST")" != "$want" ]; then
+    printf '%s\n' "$want" > "$PLIST"
+    plutil -lint "$PLIST" >/dev/null || die "bad plist: $PLIST"
+    if agent_loaded; then launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true; sleep 1; fi
+    say "  wrote $PLIST"
+  fi
+  if ! agent_loaded; then launchctl bootstrap "gui/$(id -u)" "$PLIST"; fi
+  local i=0
+  while [ ! -S "$SOCK" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+  [ -S "$SOCK" ] || die "tailscaled didn't start; see $DAEMON_LOG"
+  ok "LaunchAgent $LABEL running (pid $(agent_pid)); log $DAEMON_LOG"
+}
+
+signed_in_line() { ok "signed in to the tailnet as $(ts_json | jq -r '.Self.HostName') ($(ts ip -4 2>/dev/null | head -1))"; }
+
+default_hostname() { printf '%s-mac\n' "$(id -un | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-\n' '-')"; }
+
+# 0 when signed in; 3 when waiting for the person to open the sign-in link.
+# $1 = hostname asked for with --hostname, or empty: a Mac that is already signed in keeps its name.
+ensure_login() {
+  local want="$1" state url i=0
+  # A daemon that just (re)started says NoState or Starting for a moment, even when it is signed in.
+  # Deciding on that state would start a needless `tailscale up` (and rename the Mac): wait it out.
+  state=$(backend)
+  while { [ "$state" = NoState ] || [ "$state" = Starting ]; } && [ $i -lt 30 ]; do
+    sleep 0.5; i=$((i + 1)); state=$(backend)
+  done
+  case "$state" in
+    Running)
+      if [ -n "$want" ] && [ "$(ts_json | jq -r '.Self.HostName')" != "$want" ]; then
+        ts set --hostname="$want" && say "  renamed this Mac in the tailnet to $want"
+      fi
+      signed_in_line; return 0 ;;
+    Stopped)
+      # Signed in before, then `tailscale down`: bring it back up without changing any setting.
+      ts up >/dev/null 2>&1 || true
+      if [ "$(backend)" = Running ]; then signed_in_line; return 0; fi ;;
+  esac
+  [ -n "$want" ] || want=$(default_hostname)
+  if ! pgrep -f "tailscale --socket=$SOCK up" >/dev/null 2>&1; then
+    : > "$UP_LOG"; chmod 600 "$UP_LOG"
+    nohup "$(ts_prefix)/bin/tailscale" --socket="$SOCK" up --hostname="$want" --timeout=600s >>"$UP_LOG" 2>&1 &
+    disown 2>/dev/null || true
+  fi
+  i=0
+  while [ $i -lt 30 ]; do
+    url=$(grep -Eo 'https://login\.tailscale\.com/[^[:space:]]+' "$UP_LOG" 2>/dev/null | head -1 || true)
+    [ -n "$url" ] && break
+    if [ "$(backend)" = Running ]; then signed_in_line; return 0; fi
+    sleep 0.5; i=$((i + 1))
+  done
+  [ -n "$url" ] || die "no sign-in link from tailscale up; see $UP_LOG"
+  todo "sign this Mac in to Tailscale as $want (link valid 10 minutes):"
+  say "        $url"
+  say "        Then approve the device in the admin console if your tailnet asks."
+  return $WAIT
+}
+
+ensure_plugin() {
+  local have
+  have=$(plugin_commit)
+  if [ "$have" = "$HEELER_REF" ]; then ok "Heeler herdr plugin at ${HEELER_REF:0:7}"; return 1; fi
+  [ -n "$have" ] && say "  Heeler plugin is at ${have:0:7}; moving it to the tested ${HEELER_REF:0:7}"
+  say "Installing the Heeler herdr plugin (pinned ${HEELER_REF:0:7}; runs npm ci)"
+  local log="$STATE_DIR/plugin-install.log"
+  if ! herdr plugin install ZingerLittleBee/Heeler --ref "$HEELER_REF" --yes >"$log" 2>&1; then
+    tail -20 "$log" >&2; die "Heeler plugin install failed; full output: $log"
+  fi
+  [ "$(plugin_commit)" = "$HEELER_REF" ] || die "Heeler plugin didn't install at $HEELER_REF; see $log"
+  ok "Heeler herdr plugin at ${HEELER_REF:0:7}"
+  return 0
+}
+
+# Local accounts Remote Login lets in, as sshd decides: the com.apple.access_ssh group through the
+# membership service (dsmemberutil, cached: after a change in System Settings, `sudo dsmemberutil
+# flushcache`). No such group means "All users". HEELER_KIT_SSH_ALLOWED (tests only) replaces the lookup.
+ssh_allowed_users() {
+  local u
+  if [ -n "${HEELER_KIT_SSH_ALLOWED+set}" ]; then printf '%s\n' $HEELER_KIT_SSH_ALLOWED; return; fi
+  for u in $(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 500 && $1 !~ /^_/ { print $1 }'); do
+    if ! dscl . -read /Groups/com.apple.access_ssh >/dev/null 2>&1; then printf '%s\n' "$u"; continue; fi
+    if dsmemberutil checkmembership -U "$u" -G com.apple.access_ssh 2>/dev/null | grep -q 'is a member'; then
+      printf '%s\n' "$u"
+    fi
+  done
+  return 0
+}
+
+remote_login_access_line() {
+  local me others allowed
+  me=$(id -un)
+  allowed=$(ssh_allowed_users)
+  others=$(printf '%s\n' "$allowed" | grep -vx "$me" | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')
+  if ! printf '%s\n' "$allowed" | grep -qx "$me"; then
+    bad "Remote Login doesn't allow $me: System Settings > General > Sharing > Remote Login > (i) > add $me"
+  elif [ -n "$others" ]; then
+    bad "Remote Login also lets in: $others. System Settings > General > Sharing > Remote Login > (i) >"
+    say "        Only these users: just $me (remove Administrators or the others), then: sudo dsmemberutil flushcache"
+  else
+    ok "Remote Login allows only $me"
+  fi
+}
+
+ssh_hardening_line() {
+  if [ -f "$DROPIN" ] && grep -qi '^PasswordAuthentication no' "$DROPIN" 2>/dev/null; then
+    ok "SSH password logins off ($DROPIN)"
+  else
+    todo "SSH still accepts passwords: run heeler-kit harden-ssh"
+  fi
+}
+
+# ---------- commands ----------
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+
+cmd_install() {
+  local host="" rc=0 fresh_plugin=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hostname) host="${2:-}"; shift 2 ;;
+      --hostname=*) host="${1#*=}"; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  need_basics
+  check_prereqs || { next "fix the [!!] lines above, then run heeler-kit install again"; exit $WAIT; }
+  say "Tailscale (userspace)"
+  ensure_tailscale
+  ensure_agent
+  ensure_login "$host" || rc=$?
+  if [ $rc -eq $WAIT ]; then next "open the link, sign in, then run heeler-kit install again"; exit $WAIT; fi
+  say "Heeler"
+  ensure_plugin && fresh_plugin=0 || true
+  remote_login_access_line
+  ssh_hardening_line
+  say ""
+  say "Done on the Mac. Before you connect over the tailnet, paste the access policy:"
+  say "  heeler-kit policy   (admin console > Access controls; it allows SSH to this Mac only)"
+  if [ $fresh_plugin -eq 0 ]; then
+    next "heeler-kit pair, then scan the code with the Heeler app"
+  else
+    next "heeler-kit pair if the phone isn't paired yet"
+  fi
+}
+
+cmd_status() {
+  local state pc
+  need_basics
+  say "heeler-kit $KIT_VERSION"
+  if sshd_on; then ok "Remote Login (SSH) on port 22; the Host's User in Heeler must be $(id -un)"; else bad "Remote Login is off"; fi
+  remote_login_access_line
+  ssh_hardening_line
+  if ts_installed; then ok "tailscale $("$(ts_prefix)/bin/tailscale" version | head -1)"; else todo "tailscale formula not installed"; fi
+  if agent_loaded; then ok "LaunchAgent $LABEL (pid $(agent_pid))"; else todo "LaunchAgent $LABEL not loaded"; fi
+  if [ -S "$SOCK" ]; then
+    state=$(backend)
+    if [ "$state" = Running ]; then
+      ts_json | jq -r '"  [ok]  tailnet \(.CurrentTailnet.Name // "?"): \(.Self.HostName) \(.TailscaleIPs[0] // "") online=\(.Self.Online)"'
+      ts_json | jq -r '.Peer // {} | to_entries[] | .value | "        peer \(.HostName) (\(.OS)) online=\(.Online)"'
+    else
+      todo "tailnet: $state (heeler-kit install signs in)"
+    fi
+  fi
+  if herdr_server_up; then ok "herdr server running"; else todo "herdr server not running"; fi
+  pc=$(plugin_commit)
+  if [ "$pc" = "$HEELER_REF" ]; then ok "Heeler plugin at ${pc:0:7} (tested pin)"
+  elif [ -n "$pc" ]; then bad "Heeler plugin at ${pc:0:7}, not the tested ${HEELER_REF:0:7}: heeler-kit install"
+  else todo "Heeler plugin not installed"; fi
+  paired_lines || true
+}
+
+cmd_policy() {
+  local ip host login ports p first=1 deny=""
+  need_basics
+  [ "$(backend)" = Running ] || die "not signed in to the tailnet yet: heeler-kit install"
+  ip=$(ts ip -4 | head -1)
+  host=$(ts_json | jq -r '.Self.HostName')
+  login=$(ts_json | jq -r '(.Self.UserID | tostring) as $u | .User[$u].LoginName // empty')
+  # Local services that must stay closed to the tailnet: anything listening other than SSH, below
+  # macOS's dynamic port range (49152+), whose ports change on every run.
+  ports=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { n = split($9, a, ":"); if (a[n] + 0 < 49152) print a[n] }' |
+    sort -un | grep -vx 22 | head -40 || true)
+  for p in $ports; do
+    if [ $first -eq 1 ]; then deny="\"$host:$p\""; first=0; else deny="$deny, \"$host:$p\""; fi
+  done
+  cat <<EOF
+{
+  // Written by heeler-kit for $host. Any of your devices (Heeler on the phone) may reach
+  // $host on SSH only. Nothing else is allowed: no other port, no device-to-device traffic.
+  "hosts": {
+    "$host": "$ip"
+  },
+
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["$host"],
+      "ip":  ["tcp:22"]
+    }
+  ]$( [ -n "$login" ] && printf ',' )
+EOF
+  if [ -n "$login" ]; then
+    cat <<EOF
+
+  // Checked on every save: SSH is open, the services listening on this Mac stay closed.
+  "tests": [
+    {
+      "src":    "$login",
+      "accept": ["$host:22"]$( [ -n "$deny" ] && printf ',\n      "deny":   [%s]' "$deny" )
+    }
+  ]
+EOF
+  fi
+  say "}"
+}
+
+cmd_pair() {
+  local force=0
+  case "${1:-}" in
+    "") ;;
+    --force) force=1 ;;
+    *) die "unknown option: $1" ;;
+  esac
+  need_basics
+  herdr_server_up || { bad "herdr server isn't running: start herdr, then heeler-kit pair"; exit $WAIT; }
+  [ "$(plugin_commit)" = "$HEELER_REF" ] || die "Heeler plugin isn't installed at the tested pin: heeler-kit install"
+  local seen; seen=$(mktemp)
+  if [ $force -eq 0 ] && paired_lines >"$seen" 2>&1; then
+    say "Already paired, so no code is needed:"
+    cat "$seen"; rm -f "$seen"
+    say ""
+    say "To use the tailnet: in Heeler, edit that Host > More Options > Network: your tailnet >"
+    say "Choose from Tailnet > this Mac, port 22. To pair another iPhone or iPad: heeler-kit pair --force"
+    say ""
+    say "If Heeler says 'authentication failed': first check the Host's User is exactly $(id -un)."
+    say "If it is, the phone's key may be gone from ~/.ssh/authorized_keys (heeler-kit stays out of ~/.ssh and"
+    say "can't check): heeler-kit pair --force and scan again; pairing appends the key. Edit that file only by"
+    say "appending (>>)."
+    return 0
+  fi
+  rm -f "$seen"
+  herdr plugin action invoke heeler.pair >/dev/null
+  say "The pairing code is showing in your herdr window. Scan it with the Heeler app."
+  say "Then in Heeler: edit the Host > More Options > Network: your tailnet > Choose from Tailnet > this Mac, port 22."
+}
+
+cmd_harden_ssh() {
+  if [ -f "$DROPIN" ] && grep -qi '^PasswordAuthentication no' "$DROPIN" 2>/dev/null; then
+    ok "SSH password logins already off ($DROPIN)"; return 0
+  fi
+  say "SSH on this Mac still accepts passwords. These lines turn that off (keys only); they need sudo,"
+  say "so run them yourself in a terminal tab. Pairing with Heeler uses a key, so it keeps working:"
+  say ""
+  say "  printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\n' | sudo tee $DROPIN"
+  say "  sudo sshd -T | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication)'"
+  say ""
+  say "The second line should print both settings as 'no'. No restart needed: macOS starts a fresh sshd"
+  say "for each connection. Undo: sudo rm $DROPIN"
+  say "Check: heeler-kit status shows 'SSH password logins off'."
+}
+
+cmd_uninstall() {
+  local purge=0 keep_plugin=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1 ;;
+      --keep-plugin) keep_plugin=1 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  need_basics
+  if [ $keep_plugin -eq 0 ] && [ -n "$(plugin_commit)" ]; then
+    herdr plugin uninstall heeler >/dev/null 2>&1 && ok "Heeler herdr plugin removed"
+  fi
+  if [ $purge -eq 1 ] && [ -S "$SOCK" ] && [ "$(backend)" = Running ]; then
+    ts logout >/dev/null 2>&1 && ok "signed this Mac out of the tailnet (it leaves the device list)"
+  fi
+  if agent_loaded; then
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    # bootout can return before launchd has removed the job (seen on a busy Mac): wait up to 10 s for it.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do agent_loaded || break; sleep 0.5; done
+    if agent_loaded; then bad "LaunchAgent still loaded after 10 s: run heeler-kit uninstall again"; else ok "LaunchAgent stopped"; fi
+  fi
+  if [ -f "$PLIST" ]; then rm -f "$PLIST"; ok "removed $PLIST"; fi
+  if [ $purge -eq 1 ]; then
+    if [ -d "$STATE_DIR" ]; then
+      mv "$STATE_DIR" "$HOME/.Trash/heeler-tailscale-$(date +%Y%m%d%H%M%S)" && ok "Tailscale state moved to the Trash"
+    fi
+    if ts_installed; then brew uninstall --formula tailscale >/dev/null && ok "tailscale formula removed"; fi
+  fi
+  say ""
+  say "Left for you: the phone's key in ~/.ssh/authorized_keys (Heeler added it when pairing), the"
+  say "tailnet policy, and Remote Login (System Settings > General > Sharing)."
+}
+
+case "${1:-help}" in
+  install) shift; cmd_install "$@" ;;
+  status) cmd_status ;;
+  policy) cmd_policy ;;
+  pair) shift; cmd_pair "$@" ;;
+  harden-ssh) cmd_harden_ssh ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  __live) live_sessions ;;
+  __access) remote_login_access_line ;;
+  version|--version) say "heeler-kit $KIT_VERSION (Heeler plugin ${HEELER_REF:0:7})" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
