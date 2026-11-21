@@ -61,7 +61,7 @@ Every command is safe to run again.
   prompt instead of key presses. Typing in Heeler's terminal view goes straight into the terminal instead
   (herdr logs it as a terminal attach, not `agent.prompt`).
 - Optional: `bash install.sh --with-next-steps` also installs the next-steps plugin for Claude Code from
-  GitHub at a tested release (`KennethWKZ/next-steps#v1.0.1`, MIT; needs internet access and jq). After
+  GitHub at a tested release (`KennethWKZ/next-steps#v1.0.2`, MIT; needs internet access and jq). After
   each answer it suggests up to three next prompts and shows them as one block in the transcript (a
   header, then each suggestion on its own line, wrapped under its own text even in the phone's narrow
   view), so you can read and copy them on the phone. Pick from Heeler by sending just numbers: `3`,

@@ -11,7 +11,7 @@ set -eu
 cd "$(dirname "$0")"
 
 # The tested release: change the tag here to move everyone to a newer one.
-NEXT_STEPS_SOURCE='KennethWKZ/next-steps#v1.0.1'
+NEXT_STEPS_SOURCE='KennethWKZ/next-steps#v1.0.2'
 NEXT_STEPS_ID='next-steps@kennethwkz'
 
 with_next_steps=0
