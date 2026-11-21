@@ -33,7 +33,7 @@ set -eu
 
 # Follows the release tags (vX.Y.Z): bump it in the commit you tag. test.sh fails when it is behind the newest
 # tag, or differs from a tag on the commit it tests.
-KIT_VERSION="1.0.4"
+KIT_VERSION="1.0.5"
 # Heeler herdr plugin 0.10.0 (branch `plugin` on 2026-11-15). Move only after testing a newer one.
 HEELER_REF="${HEELER_REF:-b75384ffef59d9efa8559c3ef57ea12eb0a03910}"
 LABEL="${HEELER_KIT_LABEL:-dev.heeler.tailscaled}"
