@@ -3,6 +3,7 @@
 # live LaunchAgent, its state or the Heeler plugin: the fresh-install path runs under a test label
 # and a temp state dir, stops at the sign-in link, then uninstalls with --keep-plugin.
 # Usage: bash test.sh
+# shellcheck disable=SC2016  # t evals its condition strings, so many are single-quoted on purpose
 set -u
 cd "$(dirname "$0")" || exit 1
 KIT=./heeler-kit
@@ -113,6 +114,54 @@ if [ "${TEST_RESTART_LIVE:-}" = 1 ] && [ -n "$live_running" ]; then
   t "install after a restart keeps the name ($name_before)" "[ '$name_before' = '$name_after' ]"
 fi
 
+# extras/ok against a throwaway pending folder, and install.sh --with-ok under a throwaway HOME.
+OK=./extras/ok
+okd=$(mktemp -d "${TMPDIR:-/tmp}/heeler-oktest.XXXXXX")
+export PENDING_CMD_DIR="$okd/pending"
+okid() { printf '%s' "$1" | shasum -a 256 | cut -c1-6; }
+t "ok: syntax (bash 3.2)" "/bin/bash -n $OK"
+t "ok: carries the mark install.sh checks" "grep -q '^# ok (heeler-kit extra)' $OK"
+t "ok: nothing waiting at first" "$OK | grep -qx 'ok: nothing waiting'"
+# shellcheck disable=SC2016  # the $(( )) is part of the saved command, expanded only when ok runs it
+ok_cmd='echo ran-$((20+1))'
+ok_id=$(okid "$ok_cmd")
+# shellcheck disable=SC2034  # read inside t's condition strings, which t evals
+ok_line=$($OK --save "$ok_cmd")
+t "ok: --save prints the short line with the command" '[ "$ok_line" = "! ok $ok_id  # $ok_cmd" ]'
+t "ok: folder 700, file 600" '[ "$(stat -f %Lp "$PENDING_CMD_DIR")" = 700 ] && [ "$(stat -f %Lp "$PENDING_CMD_DIR/$ok_id")" = 600 ]'
+t "ok: list shows it" '$OK | grep -q "^$ok_id .*echo ran-"'
+# shellcheck disable=SC2034
+ok_out=$($OK "$(printf '%s' "$ok_id" | tr 'a-f' 'A-F')" 2>&1)
+t "ok: runs it by id, upper case too, and shows what ran" 'printf "%s\n" "$ok_out" | grep -q "^ok: running echo ran-" && printf "%s\n" "$ok_out" | grep -qx ran-21'
+t "ok: runs it only once" '! $OK "$ok_id" && $OK "$ok_id" 2>&1 | grep -q "nothing waiting"'
+# shellcheck disable=SC2034
+whole=$($OK --save 'echo whole-line')
+t "ok: pasting the whole line works (the shell skips the # part)" 'PATH="$PWD/extras:$PATH" bash -c "${whole#! }" | grep -qx whole-line'
+$OK --save 'echo safe' >/dev/null
+printf 'echo changed\n' > "$PENDING_CMD_DIR/$(okid 'echo safe')"
+t "ok: refuses a changed command and doesn't run it" 'out=$($OK "$(okid "echo safe")" 2>&1); [ $? -ne 0 ] && printf "%s" "$out" | grep -q "changed after it was saved" && ! printf "%s" "$out" | grep -qx changed'
+$OK --save 'echo old-one' >/dev/null
+touch -t "$(date -v-2d +%Y%m%d%H%M)" "$PENDING_CMD_DIR/$(okid 'echo old-one')"
+t "ok: a day-old command is deleted unrun" 'out=$($OK "$(okid "echo old-one")" 2>&1); [ $? -ne 0 ] && ! printf "%s" "$out" | grep -qx old-one && [ ! -e "$PENDING_CMD_DIR/$(okid "echo old-one")" ]'
+t "ok: rejects a bad id (exit 2)" '$OK zz >/dev/null 2>&1; [ $? -eq 2 ]'
+t "ok: --save rejects a multi-line command" "! $OK --save \"\$(printf 'echo a\necho b')\""
+printf 'echo other\n' > "$PENDING_CMD_DIR/$(okid 'echo clash')"
+t "ok: --save refuses an id another command holds" '! $OK --save "echo clash" && grep -qx "echo other" "$PENDING_CMD_DIR/$(okid "echo clash")"'
+unset PENDING_CMD_DIR
+
+ih="$okd/home"
+mkdir -p "$ih"
+HOME="$ih" bash install.sh >/dev/null 2>&1
+t "install.sh without --with-ok installs no ok" "[ ! -e '$ih/.local/bin/ok' ]"
+HOME="$ih" bash install.sh --with-ok >/dev/null 2>&1; rc=$?
+t "install.sh --with-ok installs ok (755)" "[ $rc -eq 0 ] && [ \"\$(stat -f %Lp '$ih/.local/bin/ok')\" = 755 ] && cmp -s $OK '$ih/.local/bin/ok'"
+HOME="$ih" bash install.sh --with-ok >/dev/null 2>&1; rc=$?
+t "install.sh --with-ok again replaces its own ok" "[ $rc -eq 0 ]"
+printf '#!/bin/sh\necho mine\n' > "$ih/.local/bin/ok"
+HOME="$ih" bash install.sh --with-ok >/dev/null 2>&1; rc=$?
+t "install.sh --with-ok refuses an ok it didn't install" "[ $rc -ne 0 ] && grep -q 'echo mine' '$ih/.local/bin/ok'"
+rm -rf "$okd"
+
 # Run install.sh --with-next-steps from a copy of this folder under a throwaway HOME and Claude config dir:
 # next-steps comes from GitHub at the tag install.sh pins. The real ~/.claude is only read. Needs the claude
 # command and GitHub; skipped without them.
@@ -125,7 +174,7 @@ if command -v claude >/dev/null && git ls-remote --exit-code --tags "https://git
   real_mk="$HOME/.claude/plugins/known_marketplaces.json"
   real_before=$(cksum "$real_mk" 2>/dev/null)
   mkdir -p "$pk/kit"
-  cp -R heeler-kit install.sh README.md skill "$pk/kit/"
+  cp -R heeler-kit install.sh README.md skill extras "$pk/kit/"
   kit="$pk/kit"
   t "install.sh pins owner/repo#tag" "printf '%s' '$ns_source' | grep -Eq '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+#[A-Za-z0-9._-]+$'"
 

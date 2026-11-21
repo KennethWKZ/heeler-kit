@@ -6,7 +6,10 @@
 # (NEXT_STEPS_SOURCE below), turns off any other next-steps copy that is on, and removes the
 # next-steps@heeler-kit copy older kits installed from the zip. Needs internet access, the claude
 # command and jq. Safe to run again; a kit with a newer tag moves the plugin to it.
-# Usage: bash install.sh [--with-next-steps]
+#
+# --with-ok also installs ~/.local/bin/ok (extras/ok): short `! ok <id>` lines for long commands on the
+# phone (see `ok --help`). It won't replace an `ok` that heeler-kit didn't install.
+# Usage: bash install.sh [--with-next-steps] [--with-ok]
 set -eu
 cd "$(dirname "$0")"
 
@@ -14,11 +17,13 @@ cd "$(dirname "$0")"
 NEXT_STEPS_SOURCE='KennethWKZ/next-steps#v1.0.2'
 NEXT_STEPS_ID='next-steps@kennethwkz'
 
-with_next_steps=0
+with_next_steps=0 with_ok=0
+OK_MARK='^# ok (heeler-kit extra)'
 for arg in "$@"; do
   case "$arg" in
     --with-next-steps) with_next_steps=1 ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --with-ok) with_ok=1 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install.sh: unknown option $arg (try --help)" >&2; exit 1 ;;
   esac
 done
@@ -27,6 +32,10 @@ done
 if [ "$with_next_steps" = 1 ]; then
   command -v claude >/dev/null || { echo "install.sh: --with-next-steps needs the claude command (Claude Code) on PATH" >&2; exit 1; }
   command -v jq >/dev/null || { echo "install.sh: --with-next-steps needs jq (macOS 15 and later include it; else brew install jq)" >&2; exit 1; }
+fi
+if [ "$with_ok" = 1 ] && [ -e "$HOME/.local/bin/ok" ] && ! grep -q "$OK_MARK" "$HOME/.local/bin/ok"; then
+  echo "install.sh: ~/.local/bin/ok exists and isn't heeler-kit's; move it away first, then run this again" >&2
+  exit 1
 fi
 
 mkdir -p "$HOME/.local/bin"
@@ -37,6 +46,15 @@ if [ -d "$HOME/.claude" ]; then
   mkdir -p "$HOME/.claude/skills/heeler-remote"
   install -m 644 skill/heeler-remote/SKILL.md "$HOME/.claude/skills/heeler-remote/SKILL.md"
   echo "installed the heeler-remote skill (~/.claude/skills/heeler-remote); restart Claude Code to load it"
+fi
+
+if [ "$with_ok" = 1 ]; then
+  install -m 755 extras/ok "$HOME/.local/bin/ok"
+  echo "installed ~/.local/bin/ok (short \`! ok <id>\` lines; ok --help)"
+  first=$(type -P ok 2>/dev/null || true)
+  if [ -n "$first" ] && [ "$first" != "$HOME/.local/bin/ok" ]; then
+    echo "note: another ok comes first on PATH ($first); put ~/.local/bin earlier to use heeler-kit's"
+  fi
 fi
 
 if [ "$with_next_steps" = 1 ]; then

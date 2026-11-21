@@ -1,0 +1,91 @@
+#!/bin/bash
+# ok (heeler-kit extra): run a command a script left for you, by a short id, so on the phone you type
+# `! ok 7f3a2c` in Claude Code instead of copying a long `cd … && node …` line.
+#
+#   ok --save '<command>'   save a one-line command and print the line to give the person:
+#                           `! ok <id>  # <command>` (pasting the whole line also works: the shell skips the # part)
+#   ok                      list what is waiting (newest first), with each full command
+#   ok <id>                 run that one, once: its file is deleted before it runs
+#
+# Each command is one file in $PENDING_CMD_DIR (default ~/.local/state/pending-cmd, mode 700), named by the first 6
+# hex characters of the command's SHA-256, holding the command on one line. A script in another language can write
+# that file itself instead of calling --save.
+# Before running, ok checks that the id is 6 hex characters, that the file's command still hashes to its id (a changed
+# file is refused) and that it is under a day old (older ones are deleted unrun). It prints the command first, so the
+# output shows what ran. It is for the person: an agent never runs `ok <id>` itself.
+set -u
+dir="${PENDING_CMD_DIR:-$HOME/.local/state/pending-cmd}"
+max_age=86400
+
+sha6() { printf '%s' "$1" | shasum -a 256 | cut -c1-6; }
+age_of() { echo $(( $(date +%s) - $(stat -f %m "$1") )); }
+
+# drop entries over a day old
+if [ -d "$dir" ]; then
+  find "$dir" -type f -mtime +0 -delete 2>/dev/null
+fi
+
+case "${1:-}" in
+  -h|--help)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  --save)
+    cmd="${2:-}"
+    if [ -z "$cmd" ] || [ $# -ne 2 ]; then
+      echo "ok: --save takes one argument, the whole command in quotes" >&2; exit 2
+    fi
+    case "$cmd" in
+      *$'\n'*|*$'\r'*) echo "ok: --save takes a one-line command" >&2; exit 2 ;;
+    esac
+    id=$(sha6 "$cmd")
+    (umask 077; mkdir -p "$dir") || exit 1
+    chmod 700 "$dir"
+    if [ -f "$dir/$id" ] && [ "$(head -1 "$dir/$id")" != "$cmd" ]; then
+      echo "ok: another waiting command has the same id ($id); run it or delete $dir/$id first" >&2; exit 1
+    fi
+    (umask 077; printf '%s\n' "$cmd" > "$dir/$id") || exit 1
+    printf '! ok %s  # %s\n' "$id" "$cmd"
+    exit 0 ;;
+  -*)
+    echo "ok: unknown option $1 (try --help)" >&2; exit 2 ;;
+esac
+
+if [ $# -eq 0 ]; then
+  if [ ! -d "$dir" ] || [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+    echo "ok: nothing waiting"
+    exit 0
+  fi
+  # newest first; the names are 6-hex ids, so reading ls line by line is safe
+  # shellcheck disable=SC2012
+  ls -t "$dir" | while IFS= read -r f; do
+    printf '%s  %4sm ago  %s\n' "$f" "$(( $(age_of "$dir/$f") / 60 ))" "$(head -1 "$dir/$f")"
+  done
+  exit 0
+fi
+
+# phone keyboards capitalise; ids are lower-case hex
+id=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+case "$id" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *) echo "ok: '$1' is not an id (6 hex characters); run 'ok' to list what is waiting" >&2; exit 2 ;;
+esac
+
+f="$dir/$id"
+if [ ! -f "$f" ]; then
+  echo "ok: nothing waiting as $id (already run, over a day old, or never saved); run 'ok' to list" >&2
+  exit 1
+fi
+cmd=$(head -1 "$f")
+if [ "$(sha6 "$cmd")" != "$id" ]; then
+  echo "ok: $id was changed after it was saved; not running it" >&2
+  exit 1
+fi
+if [ "$(age_of "$f")" -gt "$max_age" ]; then
+  rm -f "$f"
+  echo "ok: $id is over a day old; ask for a fresh line" >&2
+  exit 1
+fi
+
+rm -f "$f"
+echo "ok: running $cmd"
+exec /bin/bash -c "$cmd"

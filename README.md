@@ -66,11 +66,15 @@ Every command is safe to run again.
 - **Approve permission prompts in the terminal view.** When Claude Code asks "Do you want to proceed?", switch
   to Heeler's terminal view and press Enter. The chat box can't answer it: herdr refuses `agent.prompt` while
   an agent waits on a dialog (`agent_blocked`), so nothing reaches the prompt. A raw Enter key approves it.
-- **Short `!` lines instead of long ones.** Copying a long command on a phone is fiddly. One way round it:
-  scripts save each command they want you to run in a file named by a short hash of the command, and print
-  `! ok 7f3a2c  # <the command>`. A small `ok` script checks the hash and runs the command once. You type
-  `! ok 7f3a2c`, and pasting the whole line still works, because the shell skips the `#` part. heeler-kit
-  doesn't install such a script.
+- **Short `!` lines instead of long ones.** Copying a long command on a phone is fiddly. Optional:
+  `bash install.sh --with-ok` installs `ok` in `~/.local/bin` (it won't replace an `ok` it didn't install).
+  A script, or your agent, saves a command with `ok --save '<command>'`, which prints
+  `! ok 7f3a2c  # <the command>`. You type `! ok 7f3a2c` in Claude Code; pasting the whole line still works,
+  because the shell skips the `#` part. `ok` runs each command once, refuses one that was changed after it
+  was saved (the id is a hash of the command) or is over a day old, and prints the command before running
+  it. `ok` on its own lists what's waiting. A script in another language can write the file itself: one
+  line in `~/.local/state/pending-cmd/<id>`, where the id is the first 6 hex characters of the command's
+  SHA-256.
 - **Sign-ins that need a code, such as AWS.** `!` commands don't take typed input, so run these in a plain
   shell pane in Heeler: `aws login --remote --profile <profile>`, or `aws sso login --profile <profile>
   --use-device-code` for IAM Identity Center. Open the link on the phone, sign in there, and paste the code

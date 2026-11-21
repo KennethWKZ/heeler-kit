@@ -70,9 +70,11 @@ only, so check them with `herdr pane read`, not the transcript file.
   box can't answer it: `agent.prompt` to a blocked agent returns `agent_blocked` and sends nothing. Tested
   2026-11-21 in a throwaway herdr tab: `herdr agent prompt <agent> "1"` was refused, and `herdr agent send-keys
   <agent> enter` approved the dialog and the command ran. An `ask` rule prompts even in bypass mode.
-- **A command for them to run with `!`:** keep it short. If an `ok` runner is installed (`command -v ok`) and the
-  repo's scripts save pending commands for it, give the line exactly as the script printed it (`! ok <id>  #
-  <command>`), and never run `ok` yourself. Otherwise give one line that starts with `cd <repo root> &&`.
+- **A command for them to run with `!`:** keep it short. If `ok` is installed (`command -v ok`; `bash install.sh
+  --with-ok` puts it in `~/.local/bin`), save the command with `ok --save '<command>'` (one line, starting with
+  `cd <repo root> &&`) and give them the line it prints (`! ok <id>  # <command>`), exactly; when a repo's script
+  already printed such a line, give that one. Never run `ok <id>` yourself: those commands are theirs to run.
+  Without `ok`, give one line that starts with `cd <repo root> &&`.
 - **A sign-in that needs a code typed back** (AWS `aws login --remote`): `!` can't take typed input, so give the
   exact line for a plain shell pane, with the profile the failing command used: `aws login --remote --profile
   <profile>`, or the person's wrapper if they have one (for example `aws-login <profile> --remote`). One line per
