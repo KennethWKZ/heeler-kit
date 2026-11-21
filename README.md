@@ -60,6 +60,23 @@ Every command is safe to run again.
   `3` from the phone sends the text "3". A plugin that should react to the phone has to read the submitted
   prompt instead of key presses. Typing in Heeler's terminal view goes straight into the terminal instead
   (herdr logs it as a terminal attach, not `agent.prompt`).
+
+## Working from the phone
+
+- **Approve permission prompts in the terminal view.** When Claude Code asks "Do you want to proceed?", switch
+  to Heeler's terminal view and press Enter. The chat box can't answer it: herdr refuses `agent.prompt` while
+  an agent waits on a dialog (`agent_blocked`), so nothing reaches the prompt. A raw Enter key approves it.
+- **Short `!` lines instead of long ones.** Copying a long command on a phone is fiddly. One way round it:
+  scripts save each command they want you to run in a file named by a short hash of the command, and print
+  `! ok 7f3a2c  # <the command>`. A small `ok` script checks the hash and runs the command once. You type
+  `! ok 7f3a2c`, and pasting the whole line still works, because the shell skips the `#` part. heeler-kit
+  doesn't install such a script.
+- **Sign-ins that need a code, such as AWS.** `!` commands don't take typed input, so run these in a plain
+  shell pane in Heeler: `aws login --remote --profile <profile>`, or `aws sso login --profile <profile>
+  --use-device-code` for IAM Identity Center. Open the link on the phone, sign in there, and paste the code
+  back if it asks. With several AWS accounts, name the profile every time, and ask your agent to put it in
+  the line it gives you. The sign-in link is long and wraps over several lines in the phone's narrow view:
+  long-press to copy all of it, or use a wrapper that prints it as one short link.
 - Optional: `bash install.sh --with-next-steps` also installs the next-steps plugin for Claude Code from
   GitHub at a tested release (`KennethWKZ/next-steps#v1.0.2`, MIT; needs internet access and jq). After
   each answer it suggests up to three next prompts and shows them as one block in the transcript (a

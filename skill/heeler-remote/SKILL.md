@@ -64,6 +64,20 @@ with the header and one suggestion per line, each wrapping under its own text (c
 `$.ui.log` can't do that: it keeps an entry to one line and turns a line break into U+FFFD. Placed rows are display
 only, so check them with `herdr pane read`, not the transcript file.
 
+## When the person is on the phone
+
+- **A permission dialog waits on them:** tell them to switch to Heeler's terminal view and press Enter. The chat
+  box can't answer it: `agent.prompt` to a blocked agent returns `agent_blocked` and sends nothing. Tested
+  2026-11-21 in a throwaway herdr tab: `herdr agent prompt <agent> "1"` was refused, and `herdr agent send-keys
+  <agent> enter` approved the dialog and the command ran. An `ask` rule prompts even in bypass mode.
+- **A command for them to run with `!`:** keep it short. If an `ok` runner is installed (`command -v ok`) and the
+  repo's scripts save pending commands for it, give the line exactly as the script printed it (`! ok <id>  #
+  <command>`), and never run `ok` yourself. Otherwise give one line that starts with `cd <repo root> &&`.
+- **A sign-in that needs a code typed back** (AWS `aws login --remote`): `!` can't take typed input, so give the
+  exact line for a plain shell pane, with the profile the failing command used: `aws login --remote --profile
+  <profile>`, or the person's wrapper if they have one (for example `aws-login <profile> --remote`). One line per
+  expired profile. Never open, fill in or read that sign-in yourself, and never ask for the code.
+
 ## Phone can't connect
 
 Run `heeler-kit status` first: its last lines say whether a phone is registered and where open SSH sessions come
