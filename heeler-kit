@@ -376,7 +376,7 @@ cmd_install() {
   ensure_login "$host" || rc=$?
   if [ $rc -eq $WAIT ]; then next "open the link, sign in, then run heeler-kit install again"; exit $WAIT; fi
   say "Heeler"
-  ensure_plugin && fresh_plugin=0 || true
+  if ensure_plugin; then fresh_plugin=0; fi
   remote_login_access_line
   ssh_hardening_line
   say ""
