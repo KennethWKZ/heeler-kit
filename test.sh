@@ -4,7 +4,7 @@
 # and a temp state dir, stops at the sign-in link, then uninstalls with --keep-plugin.
 # Usage: bash test.sh   (HEELER_KIT_PACK=<path to a pack script> adds the zip checks)
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 KIT=./heeler-kit
 fail=0; n=0
 t() { # $1 = name, $2 = condition (shell), run in a subshell
@@ -51,6 +51,7 @@ tailscale 20065 user   19u  IPv4 0x615f7fda3b6b2934      0t0  TCP 127.0.0.1:4932
 ssh       20100 user    3u  IPv4 0x615f7fda3b6b2999      0t0  TCP 192.168.50.10:50000->203.0.113.9:22 (ESTABLISHED)
 sshd-sess 17700 user    7u  IPv4 0xb349622b98aeb4f9      0t0  TCP 192.168.50.10:22->198.51.100.7:40000 (ESTABLISHED)
 EOF
+# shellcheck disable=SC2034  # read inside t's condition string, which t evals
 live_out=$(HEELER_KIT_LSOF_FILE="$lsof_sample" $KIT __live)
 t "LAN session counted once despite two fd lines" "printf '%s' \"\$live_out\" | grep -qx 'local network (192.168.50.20), 1 session(s)'"
 t "tailscaled loopback connection counts as the tailnet" "printf '%s' \"\$live_out\" | grep -q '^the tailnet.*, 1 session(s)'"
@@ -65,7 +66,11 @@ rm -f "$lsof_sample"
 reg=$(jq '.devices // [] | length' "$HOME/.config/herdr/plugins/config/heeler/notifications.json" 2>/dev/null || echo 0)
 if [ "${reg:-0}" -gt 0 ]; then
   pairs() { herdr plugin log list --plugin heeler --limit 50 2>/dev/null | jq '[.. | objects | select(.action_id? == "pair")] | length'; }
-  before=$(pairs); pair_out=$($KIT pair 2>&1); sleep 1; after=$(pairs)
+  before=$(pairs)
+  # shellcheck disable=SC2034  # read inside t's condition string, which t evals
+  pair_out=$($KIT pair 2>&1)
+  sleep 1
+  after=$(pairs)
   t "pair on a paired Mac says so" "printf '%s' \"\$pair_out\" | grep -q 'Already paired'"
   t "pair on a paired Mac opens no code" "[ '$before' = '$after' ]"
 else
@@ -75,11 +80,13 @@ fi
 # Fresh install path, isolated.
 export HEELER_KIT_LABEL=dev.heeler.tailscaled.kittest
 export HEELER_KIT_STATE="${TMPDIR:-/tmp}/heeler-kittest-$$"
+# shellcheck disable=SC2034  # read inside t's condition string, which t evals
 out=$($KIT install --hostname kittest-node 2>&1); rc=$?
 t "fresh install stops for sign-in (exit 3)" "[ $rc -eq 3 ]"
 t "fresh install prints a sign-in link" "printf '%s' \"\$out\" | grep -q 'https://login.tailscale.com/'"
 t "test LaunchAgent is running" "launchctl print gui/$(id -u)/$HEELER_KIT_LABEL"
 t "state dir is private (700)" "[ \"\$(stat -f %Lp '$HEELER_KIT_STATE')\" = 700 ]"
+# shellcheck disable=SC2034  # read inside t's condition string, which t evals
 out2=$($KIT install --hostname kittest-node 2>&1)
 t "second run reuses the same link" "[ \"\$(printf '%s' \"\$out\" | grep -o 'https://login[^ ]*')\" = \"\$(printf '%s' \"\$out2\" | grep -o 'https://login[^ ]*')\" ]"
 $KIT uninstall --keep-plugin >/dev/null 2>&1
@@ -121,7 +128,8 @@ if command -v claude >/dev/null && git ls-remote --exit-code --tags "https://git
   if [ -n "${HEELER_KIT_PACK:-}" ]; then
     HEELER_KIT_DIR="$PWD" HEELER_PACK_OUT="$pk/out" bash "$HEELER_KIT_PACK" -test >/dev/null 2>&1; rc=$?
     t "pack succeeds" "[ $rc -eq 0 ]"
-    zip=$(ls "$pk"/out/*.zip 2>/dev/null | head -1)
+    zip=$(find "$pk/out" -name '*.zip' -print -quit 2>/dev/null)
+    # shellcheck disable=SC2034  # read inside t's condition string, which t evals
     list=$(unzip -Z1 "$zip" 2>/dev/null)
     t "zip has install.sh" "printf '%s\n' \"\$list\" | grep -qx 'heeler-kit/install.sh'"
     t "zip doesn't bundle next-steps/" "! printf '%s\n' \"\$list\" | grep -q 'heeler-kit/next-steps/'"

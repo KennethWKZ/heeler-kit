@@ -1,0 +1,32 @@
+# Syntax and lint for the kit's scripts. The full test.sh needs a Mac with herdr, Tailscale and Claude Code,
+# so it isn't run here: run it on a Mac (README).
+name: Check scripts
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # arm64 first: GitHub's arm64 runner, free on public repos.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: bash -n
+        run: |
+          set -eu
+          for f in heeler-kit install.sh test.sh; do bash -n "$f" && echo "ok: bash -n $f"; done
+      - name: shellcheck
+        run: |
+          set -eu
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          shellcheck --version | sed -n 2p
+          shellcheck heeler-kit install.sh test.sh
+          echo "ok: shellcheck heeler-kit install.sh test.sh"

@@ -320,6 +320,7 @@ ensure_plugin() {
 # flushcache`). No such group means "All users". HEELER_KIT_SSH_ALLOWED (tests only) replaces the lookup.
 ssh_allowed_users() {
   local u
+  # shellcheck disable=SC2086  # split on purpose: the test value is a space-separated list of accounts
   if [ -n "${HEELER_KIT_SSH_ALLOWED+set}" ]; then printf '%s\n' $HEELER_KIT_SSH_ALLOWED; return; fi
   for u in $(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 500 && $1 !~ /^_/ { print $1 }'); do
     if ! dscl . -read /Groups/com.apple.access_ssh >/dev/null 2>&1; then printf '%s\n' "$u"; continue; fi
