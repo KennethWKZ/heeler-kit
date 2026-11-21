@@ -16,6 +16,22 @@ t() { # $1 = name, $2 = condition (shell), run in a subshell
 t "syntax (bash 3.2)" "/bin/bash -n $KIT"
 t "help lists every command" "$KIT help | grep -q harden-ssh && $KIT help | grep -q keep-plugin"
 t "unknown command exits 1" "! $KIT bogus"
+
+# KIT_VERSION follows the release tags: X.Y.Z, never behind the newest vX.Y.Z tag, and equal to a tag on the commit
+# under test (so a release commit can't keep the old number). Skipped where there are no tags (a copy, not a clone).
+kit_v=$(sed -n 's/^KIT_VERSION="\(.*\)"$/\1/p' "$KIT")
+semsort() { sort -t. -k1,1n -k2,2n -k3,3n; }
+t "version is X.Y.Z and is what 'version' prints" "printf '%s' '$kit_v' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' && $KIT version | grep -q '^heeler-kit $kit_v '"
+newest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | sed 's/^v//' | semsort | tail -1)
+if [ -n "$newest" ]; then
+  t "version $kit_v isn't behind the newest tag (v$newest)" "[ \"\$(printf '%s\n%s\n' '$newest' '$kit_v' | semsort | tail -1)\" = '$kit_v' ]"
+  head_tag=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --points-at HEAD | sed 's/^v//' | semsort | tail -1)
+  if [ -n "$head_tag" ]; then
+    t "version matches the tag on this commit (v$head_tag)" "[ '$kit_v' = '$head_tag' ]"
+  fi
+else
+  echo "skip version-vs-tag checks: no release tags here"
+fi
 t "status runs" "$KIT status"
 # 2026-11-21: a `grep && printf` loop ending made set -e stop status silently halfway. status must reach
 # its last section (the paired-device lines) on this Mac.
